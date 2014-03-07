@@ -4,9 +4,10 @@
 import numpy as np
 cimport numpy as np
 from libcpp.string cimport string
+from libcpp cimport bool as c_bool
 from libc.math cimport sqrt, floor, fabs
 cimport libc
-from healpy import npix2nside
+from healpy import npix2nside, nside2npix
 from healpy.pixelfunc import maptype
 import os
 import cython
@@ -28,7 +29,19 @@ cdef extern from "alm_healpix_tools.h":
                                Alm[xcomplex[double]] &almC,
                                int num_iter,
                                arr[double] &weight)
-
+    cdef void cxx_map2alm_spin "map2alm_spin" (Healpix_Map[double] &map1,
+                                             Healpix_Map[double] &map2,
+                                             Alm[xcomplex[double]] &alm1, 
+                                             Alm[xcomplex[double]] &alm2,
+                                             int spin,
+                                             arr[double] &weight,
+                                             c_bool add_alm)
+    cdef void cxx_alm2map_spin "alm2map_spin" (Alm[xcomplex[double]] &alm1,
+                                             Alm[xcomplex[double]] &alm2,
+                                             Healpix_Map[double] &map1,
+                                             Healpix_Map[double] &map2, 
+                                             int spin)
+	
 cdef extern from "alm_powspec_tools.h":
     cdef void c_rotate_alm "rotate_alm" (Alm[xcomplex[double]] &alm, double psi, double theta, double phi)
     cdef void c_rotate_alm "rotate_alm" (Alm[xcomplex[double]] &ai, Alm[xcomplex[double]] &ag, Alm[xcomplex[double]] &ac, double psi, double theta, double phi)
@@ -190,6 +203,181 @@ def map2alm(m, lmax = None, mmax = None, niter = 3, use_weights = False,
     else:
         del MI, AI
         return almI
+
+def map2alm_spin(m, spin, lmax = None, mmax = None, niter = 3, use_weights = False, 
+            datapath = None):
+    """Computes the alm of a Healpix map.
+
+    Parameters
+    ----------
+    m : array-like, shape (2, Npix)
+      The 2 input maps.
+    spin, int, scalar
+      spin of the input maps
+    lmax : int, scalar, optional
+      Maximum l of the power spectrum. Default: 3*nside-1
+    mmax : int, scalar, optional
+      Maximum m of the alm. Default: lmax
+    iter : int, scalar, optional
+      Number of iteration (default: 3)
+    use_weights: bool, scalar, optional
+      If True, use the ring weighting. Default: False.
+    
+    Returns
+    -------
+    alm : tuple of arrays
+      The 2 output alm.
+    """
+    
+    info = maptype(m)
+    if info == 2:
+        m0 = np.ascontiguousarray(m[0], dtype=np.float64)
+        m1 = np.ascontiguousarray(m[1], dtype=np.float64)
+    else:
+        raise ValueError("Wrong input map (must be a valid sequence of 2 Healpix maps)")
+    
+    # create UNSEEN mask for both maps
+    mask_m0 = False if count_bad(m0) == 0 else mkmask(m0)
+    mask_m1 = False if count_bad(m1) == 0 else mkmask(m1)
+
+    # Adjust lmax and mmax
+    cdef int lmax_, mmax_, nside, npix
+    npix = m0.size
+    nside = npix2nside(npix)
+    if lmax is None:
+        lmax_ = 3 * nside - 1
+    else:
+        lmax_ = lmax
+    if mmax is None:
+        mmax_ = lmax_
+    else:
+        mmax_ = mmax
+
+    # Check all maps have same npix
+    if m1.size != npix:
+        raise ValueError("Input maps must have same size")
+    
+    # View the ndarray as a Healpix_Map
+    M0 = ndarray2map(m0, RING)
+    M1 = ndarray2map(m1, RING)
+
+    # replace UNSEEN pixels with zeros
+    if mask_m0 is not False:
+        m0[mask_m0] = 0.0
+    if mask_m1 is not False:
+        m1[mask_m1] = 0.0
+
+
+    # Create an ndarray object that will contain the alm for output (to be returned)
+    n_alm = alm_getn(lmax_, mmax_)
+    alm0 = np.empty(n_alm, dtype=np.complex128)
+    alm1 = np.empty(n_alm, dtype=np.complex128)
+
+    # View the ndarray as an Alm
+    A0 = ndarray2alm(alm0, lmax_, mmax_)
+    A1 = ndarray2alm(alm1, lmax_, mmax_)
+    
+    # ring weights
+    cdef arr[double] * w_arr = new arr[double]()
+    cdef int i
+    cdef char *c_datapath
+    if use_weights:
+        if datapath is None:
+            datapath = get_datapath()
+        c_datapath = datapath
+        weightfile = 'weight_ring_n%05d.fits' % (nside)
+        if not os.path.isfile(os.path.join(datapath, weightfile)):
+            raise IOError('Weight file not found in %s' % (datapath))
+        read_weight_ring(string(c_datapath), nside, w_arr[0])
+        for i in range(w_arr.size()):
+            w_arr[0][i] += 1
+    else:
+        w_arr.allocAndFill(2 * nside, 1.)
+    
+    #Implementing the loop for a possible map2alm_spin_iter here since there is no actual map2alm_spin_iter. 
+    m02 = np.empty(npix, dtype=np.float64)
+    m12 = np.empty(npix, dtype=np.float64)
+    
+    M02 = ndarray2map(m02, RING)
+    M12 = ndarray2map(m12, RING)
+
+    cxx_map2alm_spin(M0[0], M1[0], A0[0], A1[0], spin, w_arr[0], False)
+    for i in range(niter):
+        cxx_alm2map_spin(A0[0], A1[0], M02[0], M12[0], spin)
+        m02[:] = m0[:] - m02[:]
+        m12[:] = m1[:] - m12[:]
+        cxx_map2alm_spin(M02[0], M12[0], A0[0], A1[0], spin, w_arr[0], True)
+
+    # restore input map with UNSEEN pixels
+    if mask_m0 is not False:
+        m0[mask_m0] = UNSEEN
+    if mask_m1 is not False:
+        m1[mask_m1] = UNSEEN
+    
+    del w_arr
+    del M0, M1, A0, A1
+	
+    return alm0, alm1
+
+def alm2map_spin(alms, spin, nside, lmax = None, mmax = None):
+    """Computes the alm of a Healpix map.
+
+    Parameters
+    ----------
+    alms : array-like, shape (2, Npix)
+      List of 2 input alms.
+	spin : int, scalar
+      spin of the maps to be generated
+	nside : int, scalar
+	  nside of the output maps
+    lmax : int, scalar, optional
+      Maximum l of the power spectrum. Default: 3*nside-1
+    mmax : int, scalar, optional
+      Maximum m of the alm. Default: lmax
+    
+    Returns
+    -------
+    maps : tuple of arrays
+      tuple of 2 maps with the specified spin.
+    """
+    
+    info = len(alms)
+    if info == 2:
+        alm0 = np.ascontiguousarray(alms[0], dtype=np.complex128)
+        alm1 = np.ascontiguousarray(alms[1], dtype=np.complex128)
+    else:
+        raise ValueError("Wrong input alms (must be a valid sequence of 2 alms)")
+    
+    # Adjust lmax and mmax
+    cdef int lmax_, mmax_
+    if lmax is None:
+        lmax_ = alm_getlmax(alm0.size)
+    else:
+        lmax_ = lmax
+		
+    if mmax is None:
+        mmax_ = lmax_
+    else:
+        mmax_ = mmax
+    
+    # View the ndarray as an Alm
+    A0 = ndarray2alm(alm0, lmax_, mmax_)
+    A1 = ndarray2alm(alm1, lmax_, mmax_)
+
+    # Create an ndarray object that will contain the maps for output (to be returned)
+    npix = nside2npix(nside)
+    m0 = np.empty(npix, dtype=np.float64)
+    m1 = np.empty(npix, dtype=np.float64)
+
+	# View the ndarray as a Healpix_Map
+    M0 = ndarray2map(m0, RING)
+    M1 = ndarray2map(m1, RING)
+
+    cxx_alm2map_spin(A0[0],A1[0],M0[0],M1[0],spin)
+
+    del A0, A1, M0, M1
+
+    return m0, m1
 
 
 def alm2cl(alms, alms2 = None, lmax = None, mmax = None, lmax_out = None):

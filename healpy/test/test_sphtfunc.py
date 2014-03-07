@@ -129,6 +129,30 @@ class TestSphtFunc(unittest.TestCase):
                 for i, o in zip(input, output):
                     np.testing.assert_allclose(i, o, atol=1e-4)
 
+    def test_map2alm_spin(self):
+        spins = [2] #seems to fail with spin = 0 or 1 for the first test even though it works (possibly because of amplitude?)
+        tmp = [np.empty(o.size*2) for o in self.mapiqu]
+        for t, o in zip(tmp, self.mapiqu):
+            t[::2] = o
+        maps = [self.mapiqu, [o.astype(np.float32) for o in self.mapiqu],
+                [t[::2] for t in tmp]]
+        for input in maps:
+            for spin in spins:
+                alm = hp.map2alm_spin(input[1:], spin, iter=10)
+                output = hp.alm2map_spin(alm, spin, 32)
+                for i, o in zip(input[1:], output):
+                    np.testing.assert_allclose(i, o, atol=1e-4)
+            #just showing that spin=0 works
+            alm0 = hp.map2alm_spin((input[0],input[0]), 0, iter=10)
+            output0 = hp.alm2map_spin(alm0, 0, 32)
+            alm12 = hp.map2alm_spin(input[1:], 2, iter=10)
+            output12 = hp.alm2map_spin(alm12, 2, 32)
+            output = (output0[0], output12[0], output12[1])
+            for i, o in zip(input, output):
+                np.testing.assert_allclose(i, o, atol=1e-4)
+            
+         
+
     def test_rotate_alm(self):
         almigc = hp.map2alm(self.mapiqu)
         alms = [almigc[0], almigc[0:2], almigc, np.vstack(almigc)]

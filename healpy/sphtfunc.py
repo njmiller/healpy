@@ -246,6 +246,119 @@ def alm2map(alms, nside, lmax = None, mmax = None, pixwin = False,
     else:
         return output
 
+def map2alm_spin(maps, spin, lmax = None, mmax = None, iter = 3, use_weights = False, 
+		datapath = ''):
+    """Computes the alm of an Healpix map with spin s.
+    
+    Parameters
+    ----------
+    maps : array-like, shape (2, Npix)
+      list of 2 input maps.
+	spin : int, scalar
+		spin of the maps to be analyzed
+    lmax : int, scalar, optional
+      Maximum l of the power spectrum. Default: 3*nside-1
+    mmax : int, scalar, optional
+      Maximum m of the alm. Default: lmax
+    iter : int, scalar, optional
+      Number of iteration (default: 3)
+    use_weights: bool, scalar, optional
+      If True, use the ring weighting. Default: False.
+    datapath : None or str, optional
+      If given, the directory where to find the weights data.
+    
+    Returns
+    -------
+    alms : tuple of array
+      tuple of 2 alm.
+    
+    Notes
+    -----
+    The pixels which have the special `UNSEEN` value are replaced by zeros
+    before spherical harmonic transform. They are converted back to `UNSEEN`
+    value, so that the input maps are not modified. Each map has its own, 
+    independent mask.
+    """
+    maps = ma_to_array(maps)
+
+    if spin > 0:
+        alms = _sphtools.map2alm_spin(maps, spin, niter = iter, datapath = datapath, use_weights = use_weights,
+                             lmax = lmax, mmax = mmax)
+    else:
+        alms = [-_sphtools.map2alm(mm, niter = iter,
+                                  datapath = datapath, use_weights = use_weights,
+                                  lmax = lmax, mmax = mmax)
+                for mm in maps]
+				
+    return alms
+
+def alm2map_spin(alms, spin, nside, lmax = None, mmax = None,
+            fwhm = 0.0, sigma = None, invert = False,
+            inplace = False, verbose=True):
+    """Computes an spin-weighted Healpix map given the alm.
+
+    The alm are given as a complex array. You can specify lmax
+    and mmax, or they will be computed from array size (assuming
+    lmax==mmax).
+
+    Parameters
+    ----------
+    alms : complex, sequence of two arrays
+      A sequence of two complex arrays.
+      Each array must have a size of the form: mmax * (2 * lmax + 1 - mmax) / 2 + lmax + 1
+	spin : int, scalar
+	  The spin of the the maps to be generated
+    nside : int, scalar
+      The nside of the output map.
+    lmax : None or int, scalar, optional
+      Explicitly define lmax (needed if mmax!=lmax)
+    mmax : None or int, scalar, optional
+      Explicitly define mmax (needed if mmax!=lmax)
+    fwhm : float, scalar, optional
+      The fwhm of the Gaussian used to smooth the map (applied on alm)
+      [in radians]
+    sigma : float, scalar, optional
+      The sigma of the Gaussian used to smooth the map (applied on alm)
+      [in radians]
+    invert : bool, optional
+      If True, alms are divided by Gaussian beam function (un-smooth).
+      Otherwise, alms are multiplied by Gaussian beam function (smooth).
+      Default: False.
+    inplace : bool, optional
+      If True, input alms may be modified by beam
+      smoothing (if alm(s) are complex128 contiguous arrays).
+      Otherwise, input alms are not modified. A copy is made if needed to
+      apply beam smoothing or pixel window.
+      
+    Returns
+    -------
+    maps : list of arrays
+      A list of two maps (if spin=2, these will be Q and U assuming input alm are E and B)
+    """
+    
+    if not cb.is_seq(alms):
+        raise TypeError("alms must be a sequence")
+
+    alms = smoothalm_spin(alms, spin, fwhm = fwhm, sigma = sigma, invert = invert, 
+            inplace = inplace, verbose=verbose)
+
+    if not cb.is_seq_of_seq(alms):
+        raise TypeError("alms must be a sequence of a sequence")
+    
+    if spin > 0:
+        output = _sphtools.alm2map_spin(alms, spin,
+            nside, lmax = lmax, mmax = mmax)
+    else:
+        if lmax is None:
+            lmax = -1
+        if mmax is None:
+            mmax = -1
+
+        output = [-sphtlib._alm2map(alm, nside, lmax = lmax, mmax = mmax)
+                  for alm in alms]
+	
+    return output
+
 def synalm(cls, lmax = None, mmax = None, new = False, verbose=True):
     """Generate a set of alm given cl.
     The cl are given as a float array. Corresponding alm are generated.
@@ -665,6 +778,87 @@ def smoothalm(alms, fwhm = 0.0, sigma = None, invert = False, pol = True,
             # return the list of alm
             return retalm
     # Case 2b:
+    # all smoothing have been performed in place:
+    # return the input alms
+    return alms
+
+def smoothalm_spin(alms, spin, fwhm = 0.0, sigma = None, invert = False,
+              mmax = None, inplace = True, verbose = True):
+
+    """Smooth a set of spin alm with a Gaussian symmetric beam function.
+
+    Parameters
+    ----------
+    alms : sequence of arrays
+      sequence of arrays. All alms are generated from spherical harmonics with the same spin
+    spin : integer
+	  spin for the spherical harmonics used to calculate the input alms
+    fwhm : float, optional
+      The full width half max parameter of the Gaussian. Default:0.0
+      [in radians]
+    sigma : float, optional
+      The sigma of the Gaussian. Override fwhm.
+      [in radians]
+    invert : bool, optional
+      If True, alms are divided by Gaussian beam function (un-smooth).
+      Otherwise, alms are multiplied by Gaussian beam function (smooth).
+      Default: False.
+    mmax : None or int, optional
+      The maximum m for alm. Default: mmax=lmax
+    inplace : bool, optional
+      If True, the alm's are modified inplace if they are contiguous arrays
+      of type complex128. Otherwise, a copy of alm is made. Default: True.
+    verbose : bool, optional
+      If True prints diagnostic information. Default: True
+
+    Returns
+    -------
+    alms : sequence of arrays
+      The smoothed alm. If alm[i] is a contiguous array of type complex128,
+      and *inplace* is True the smoothing is applied inplace.
+      Otherwise, a copy is made.
+    """
+	
+    if sigma is None:
+        sigma = fwhm / (np.sqrt(8*np.log(2.)))
+
+    if verbose:
+        print "Sigma is %f arcmin (%f rad) " %  (sigma*60*180/pi,sigma)
+        print "-> fwhm is %f arcmin" % (sigma*60*180/pi*(2.*np.sqrt(2.*np.log(2.))))
+    
+	# Check alms
+    if not cb.is_seq(alms):
+        raise ValueError("alm must be a sequence")
+    
+    if sigma == 0:
+        # nothing to be done
+        return alms
+
+	if len(alms) != 2:
+		raise ValueError("We must have 2 alm")
+    
+	# we have multiple alms -> apply the same smoothing to each map.
+    # different spins have different B_l
+    # exp{-[ell(ell+1) - s**2] * sigma**2/2}
+    # with s the spin of spherical harmonics
+    # s = spin
+    retalm = []
+    for ialm, alm in enumerate(alms):
+        lmax = Alm.getlmax(len(alm), mmax)
+        if lmax < 0:
+            raise TypeError('Wrong alm size for the given '
+                            'mmax (len(alms[%d]) = %d).'%(ialm, len(alm)))
+        ell = np.arange(lmax + 1.)
+        fact = np.exp(-0.5 * (ell * (ell + 1) - spin ** 2) * sigma ** 2)
+        res = almxfl(alm, fact, mmax = mmax, inplace = inplace)
+        retalm.append(res)
+    
+    for i in xrange(len(alms)):
+        samearray = alms[i] is retalm[i]
+        if not samearray:
+            # at least one of the alm could not be smoothed in place:
+            # return the list of alm
+            return retalm
     # all smoothing have been performed in place:
     # return the input alms
     return alms
